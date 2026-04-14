@@ -25,6 +25,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Qwen config
+.qwen/
+
 # Temp files
 *.tmp
 *.bak

@@ -1,10 +1,33 @@
 const admin = require("firebase-admin");
-const serviceAccount = require("../serviceAccount.json");
 
 if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
+  let credential;
+
+  // Option 1: Read from Environment Variable (For Render/Docker deployment)
+  if (process.env.SERVICE_ACCOUNT_JSON) {
+    try {
+      // Parse the JSON string from the env var
+      const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
+      credential = admin.credential.cert(serviceAccount);
+      console.log("Firebase initialized via Environment Variable");
+    } catch (err) {
+      console.error("Failed to parse SERVICE_ACCOUNT_JSON:", err.message);
+    }
+  } 
+  // Option 2: Fallback to local file (For local development)
+  else {
+    try {
+      const serviceAccount = require("../serviceAccount.json");
+      credential = admin.credential.cert(serviceAccount);
+      console.log("Firebase initialized via serviceAccount.json file");
+    } catch (err) {
+      console.error("Firebase initialization failed:", err.message);
+    }
+  }
+
+  if (credential) {
+    admin.initializeApp({ credential });
+  }
 }
 
 const db = admin.firestore();
