@@ -5,7 +5,7 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 const apiRoutes = require("./routes/api");
 const { verifyToken } = require("./middleware/auth");
-console.log("Service account loaded:", require("./serviceAccount.json").project_id);
+console.log("Firebase Auth initialized");
 
 // Initialize global temp storage
 global.tempMeetingData = {};
