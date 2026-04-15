@@ -63,9 +63,10 @@ class MeetBot {
     if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
 
     // Use headless mode in Docker/Linux environments without display
-    const isDocker = fs.existsSync("/.dockerenv") || process.env.NODE_ENV === "production";
+    // Detect Render, Docker, or Production environment
+    const isServer = process.env.RENDER === "true" || fs.existsSync("/.dockerenv") || process.env.NODE_ENV === "production";
     const launchOptions = {
-      headless: isDocker ? "new" : false,
+      headless: isServer ? "new" : false,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
