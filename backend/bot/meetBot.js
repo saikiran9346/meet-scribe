@@ -534,17 +534,20 @@ class MeetBot {
         function findAndObserveCaptions() {
           retryCount++;
 
-          // All known Google Meet caption selectors
+          // All known Google Meet caption selectors (Updated for 2026)
           const selectors = [
             ".a4cQT",
             ".TBnnec",
             ".CNusmb",
             ".iOzk7",
+            ".u3AOsd",
             "[jsname='tgaKEf']",
+            "[jsname='GJ1sEc']",
             "[data-message-text]",
             "[class*='caption']",
             "[class*='Caption']",
             "[class*='transcript']",
+            "div[aria-label='Live captions']",
           ];
 
           let container = null;
