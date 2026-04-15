@@ -62,8 +62,10 @@ class MeetBot {
     const userDataDir = path.join(os.tmpdir(), "meet-scribe-browser-data");
     if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
 
+    // Use headless mode in Docker/Linux environments without display
+    const isDocker = fs.existsSync("/.dockerenv") || process.env.NODE_ENV === "production";
     const launchOptions = {
-      headless: false,
+      headless: isDocker ? "new" : false,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
