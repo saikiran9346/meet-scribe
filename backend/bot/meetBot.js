@@ -478,50 +478,76 @@ class MeetBot {
   async _enableCaptions() {
     console.log("💬 Enabling captions...");
     try {
-      await this.sleep(3000);
-      
-      // Turn on captions with 'C' key
-      await this.page.keyboard.press("C");
-      await this.sleep(1000);
-      
-      // Click video to focus
-      await this.page.click("[data-participant-id]").catch(() => {});
-      await this.sleep(1000);
-      
-      // Press 'C' again to ensure they stay on
-      await this.page.keyboard.press("C");
-      await this.sleep(1000);
+      // Wait for meeting to stabilize
+      await this.sleep(5000);
 
-      console.log("✅ Captions enabled");
+      // Try multiple methods to enable captions
+      console.log("🔧 Attempting to enable captions via multiple methods...");
 
-      // Keep captions on: watch for them turning off and re-enable
-      await this.page.evaluate(() => {
-        let captionsOn = true;
-        
-        // Watch for caption container appearing/disappearing
-        const observer = new MutationObserver(() => {
-          const captionBox = document.querySelector(".a4cQT, .TBnnec, .CNusmb, .iOzk7, [jsname='tgaKEf'], [data-message-text]");
-          if (!captionBox && captionsOn) {
-            console.log("🔄 Captions turned off, re-enabling...");
-            captionsOn = false;
-            setTimeout(() => {
-              document.dispatchEvent(new KeyboardEvent("keydown", { key: "c" }));
-              captionsOn = true;
-            }, 500);
-          } else if (captionBox) {
-            captionsOn = true;
+      // Method 1: Click the captions button directly
+      try {
+        // Find and click the captions button (CC icon)
+        const captionButtonSelectors = [
+          "button[aria-label='Turn on captions']",
+          "button[aria-label='Captions']",
+          "button[title='Captions']",
+          "[data-tooltip='Captions (c)']",
+          "button[jsname='CQylAd']",
+          ".u3AOsd", // Sometimes the button itself
+        ];
+
+        for (const selector of captionButtonSelectors) {
+          const btn = await this.page.$(selector);
+          if (btn) {
+            console.log(`✅ Found captions button: ${selector}`);
+            await btn.click();
+            await this.sleep(2000);
+            break;
           }
-        });
-        
-        observer.observe(document.body, { childList: true, subtree: true });
-        
-        // Periodically ensure captions stay on
+        }
+      } catch (e) {
+        console.log("ℹ️ Direct button click failed, trying keyboard...");
+      }
+
+      // Method 2: Press 'C' key multiple times
+      console.log("⌨️ Pressing 'C' key to toggle captions...");
+      await this.page.keyboard.press("C");
+      await this.sleep(1000);
+      await this.page.keyboard.press("C");
+      await this.sleep(1000);
+
+      // Method 3: Use the meeting controls menu
+      try {
+        // Click the three dots menu
+        const menuBtn = await this.page.$("button[jsname='NakZHc'], button[aria-label='More options']");
+        if (menuBtn) {
+          await menuBtn.click();
+          await this.sleep(1000);
+          // Look for captions option in menu
+          const captionOption = await this.page.$("div[role='menuitem']:has-text('Captions'), button:has-text('Captions')");
+          if (captionOption) {
+            await captionOption.click();
+            await this.sleep(1000);
+          }
+          // Close menu by pressing Escape
+          await this.page.keyboard.press("Escape");
+        }
+      } catch (e) {
+        console.log("ℹ️ Menu method failed");
+      }
+
+      console.log("✅ Caption activation sequence complete");
+
+      // Now set up the watcher to keep captions on
+      await this.page.evaluate(() => {
+        // Watch for caption container and re-enable if needed
         setInterval(() => {
-          const captionBox = document.querySelector(".a4cQT, .TBnnec, .CNusmb, .iOzk7, [jsname='tgaKEf'], [data-message-text]");
+          const captionBox = document.querySelector(".a4cQT, .TBnnec, .CNusmb, .iOzk7, .u3AOsd, [jsname='tgaKEf'], [data-message-text], div[aria-label='Live captions']");
           if (!captionBox) {
+            // Try to re-enable by pressing C
             document.dispatchEvent(new KeyboardEvent("keydown", { key: "c" }));
           }
-        }, 10000);
+        }, 5000);
       });
 
       console.log("✅ Caption watcher active");
@@ -529,7 +555,7 @@ class MeetBot {
       // Start observing DOM for caption container AND active speaker
       await this.page.evaluate(() => {
         let retryCount = 0;
-        const maxRetries = 20;
+        const maxRetries = 30; // Increased retries
 
         // Exposed function to update the current speaker
         window._updateSpeaker = function(name) {
