@@ -232,10 +232,10 @@ class MeetBot {
   }
 
   async _signInToGoogle() {
-    console.log("🔐 Opening Google sign-in...");
+    console.log("🔐 Attempting to auto-login...");
     this.emit("bot-status", {
       status: "waiting-signin",
-      message: "Please sign in to Google in the browser window.",
+      message: "Bot is logging in...",
     });
 
     await this.page.goto(

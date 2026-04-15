@@ -28,6 +28,9 @@ Thumbs.db
 # Qwen config
 .qwen/
 
+# Continue AI config
+.continue/
+
 # Temp files
 *.tmp
 *.bak
