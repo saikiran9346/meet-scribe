@@ -464,14 +464,58 @@ class MeetBot {
   }
 
   async _enableCaptions() {
-    console.log("💬 Enabling captions via keyboard shortcut...");
+    console.log("💬 Enabling captions (attempting multiple methods)...");
     try {
-      await this.sleep(2000);
+      // 1. Wait for meeting to stabilize
+      await this.sleep(5000);
 
-      // Use keyboard shortcut C to toggle captions
-      await this.page.keyboard.press("c");
-      await this.sleep(1000);
-      console.log("✅ Caption shortcut pressed (C)");
+      // 2. Focus the meeting area so shortcuts work
+      console.log("👆 Clicking video to focus...");
+      await this.page.click("[data-participant-id]")
+        .catch(() => {});
+
+      // 3. Method A: Keyboard shortcut 'C' (Press 3 times to be safe)
+      console.log("⌨️ Pressing 'C' shortcut 3 times...");
+      for (let i = 0; i < 3; i++) {
+        await this.page.keyboard.press("C");
+        await this.sleep(1000);
+      }
+
+      // 4. Method B: Click the "Captions" icon directly (Bottom right icon)
+      console.log("🖱️ Attempting to click Captions icon...");
+      
+      // Try clicking the CC button selector
+      const captionButtons = [
+        "button[jsname='CQylAd']", // Common CC button
+        "button[aria-label='Turn on captions']",
+        "button[aria-label='Captions']",
+        "button[title='Captions']",
+        "[data-tooltip='Captions (c)']",
+      ];
+
+      for (const selector of captionButtons) {
+        const btn = await this.page.$(selector);
+        if (btn) {
+          console.log("✅ Found Captions button, clicking...");
+          await btn.click();
+          await this.sleep(1000);
+          break;
+        }
+      }
+
+      // 5. Method C: If a popup appears saying "Turn on captions", click it
+      console.log("👀 Checking for 'Turn on captions' prompt...");
+      try {
+        const promptBtn = await this.page.waitForSelector("button[jsname='CQylAd'], div[role='dialog'] button", { timeout: 3000 });
+        if (promptBtn) {
+          console.log("✅ Clicking 'Turn on captions' prompt...");
+          await promptBtn.click();
+        }
+      } catch (e) {
+        console.log("ℹ️ No 'Turn on captions' prompt found (that's okay).");
+      }
+
+      console.log("✅ Captions activation sequence complete.");
 
       // Start observing DOM for caption container AND active speaker
       await this.page.evaluate(() => {
