@@ -232,64 +232,56 @@ class MeetBot {
   }
 
   async _signInToGoogle() {
-    const email = process.env.BOT_EMAIL;
-    const password = process.env.BOT_PASSWORD;
+    console.log("🔐 Opening Google sign-in...");
+    this.emit("bot-status", {
+      status: "waiting-signin",
+      message: "Please sign in to Google in the browser window.",
+    });
 
-    if (!email || !password) {
-      console.log("⚠️ BOT_EMAIL or BOT_PASSWORD not set. Waiting for manual login...");
-      this.emit("bot-status", { status: "waiting-signin", message: "Please sign in to Google in the browser window." });
-      await this.page.waitForSelector("[data-email]", { timeout: 120000 }).catch(() => {});
-      return;
-    }
+    await this.page.goto(
+      "https://accounts.google.com/ServiceLogin?continue=https://www.google.com",
+      { waitUntil: "networkidle2", timeout: 30000 }
+    );
 
-    console.log("🔐 Attempting auto-login...");
-    this.emit("bot-status", { status: "waiting-signin", message: "Bot is logging in..." });
+    await this.sleep(2000);
+    console.log("📸 Waiting for you to sign in...");
 
-    try {
-      // 1. Go to Google Sign In
-      await this.page.goto("https://accounts.google.com", { waitUntil: "networkidle2", timeout: 30000 });
-      
-      // 2. Type Email
-      await this.page.waitForSelector("input[type='email']", { timeout: 10000 });
-      await this.page.type("input[type='email']", email, { delay: 50 });
-      await this.sleep(1000);
-      
-      // 3. Click Next
-      const nextBtn = await this.page.$("#identifierNext");
-      if (nextBtn) await nextBtn.click();
-      else await this.page.keyboard.press("Enter");
-      
-      // 4. Handle "This looks unfamiliar" or "Verify it's you"
+    const MAX_WAIT = 5 * 60 * 1000; // Wait 5 minutes
+    const CHECK_INTERVAL = 2000;
+    let elapsed = 0;
+
+    while (elapsed < MAX_WAIT) {
       try {
-        const suspiciousBtn = await this.page.waitForSelector("button[jsname='O0EWce'], button:has-text('Yes, it\\'s me'), div[role='button']:has-text('Yes')", { timeout: 5000 });
-        if (suspiciousBtn) {
-          console.log("🛡️ Found 'Verify it's you' prompt. Clicking...");
-          await suspiciousBtn.click();
+        const url = this.page.url();
+        // If we are no longer on the accounts page, login was likely successful
+        if (url.includes("google.com") && !url.includes("accounts.google.com")) {
+          console.log("✅ Sign-in detected!");
+          this.emit("bot-status", { status: "success", message: "Signed in! Going to meeting..." });
           await this.sleep(2000);
+          return;
         }
-      } catch (e) { /* No prompt, continue */ }
+        if (url.includes("myaccount.google.com")) {
+          console.log("✅ Account page — signed in!");
+          this.emit("bot-status", { status: "success", message: "Signed in! Going to meeting..." });
+          await this.sleep(2000);
+          return;
+        }
+      } catch (_) {}
 
-      // 5. Type Password
-      await this.page.waitForSelector("input[type='password']", { timeout: 15000 });
-      await this.page.type("input[type='password']", password, { delay: 50 });
-      await this.sleep(1000);
-      
-      // 6. Click Next
-      const passNextBtn = await this.page.$("#passwordNext");
-      if (passNextBtn) await passNextBtn.click();
-      else await this.page.keyboard.press("Enter");
+      await this.sleep(CHECK_INTERVAL);
+      elapsed += CHECK_INTERVAL;
 
-      // 7. Wait for successful login (redirect to Google or Meet)
-      console.log("⏳ Waiting for login to complete...");
-      await this.page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => {});
-      
-      console.log("✅ Auto-login successful!");
-    } catch (err) {
-      console.error("❌ Auto-login failed:", err.message);
-      console.log("⏳ Falling back to manual sign-in wait...");
-      this.emit("bot-status", { status: "waiting-signin", message: "Login failed. Please check credentials." });
-      await this.sleep(60000); // Wait a bit before failing
+      if (elapsed % 30000 === 0) {
+        console.log(`⏳ Waiting for sign-in... (${Math.floor(elapsed / 1000)}s)`);
+        this.emit("bot-status", {
+          status: "waiting-signin",
+          message: `Waiting for sign-in... (${Math.floor(elapsed / 1000)}s)`,
+        });
+      }
     }
+
+    console.log("⚠️ Sign-in timeout. Proceeding...");
+    await this.sleep(2000);
   }
 
   async _joinMeeting() {
