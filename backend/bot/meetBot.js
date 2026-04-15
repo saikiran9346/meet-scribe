@@ -464,58 +464,55 @@ class MeetBot {
   }
 
   async _enableCaptions() {
-    console.log("💬 Enabling captions (attempting multiple methods)...");
+    console.log("💬 Enabling captions...");
     try {
-      // 1. Wait for meeting to stabilize
-      await this.sleep(5000);
-
-      // 2. Focus the meeting area so shortcuts work
-      console.log("👆 Clicking video to focus...");
-      await this.page.click("[data-participant-id]")
-        .catch(() => {});
-
-      // 3. Method A: Keyboard shortcut 'C' (Press 3 times to be safe)
-      console.log("⌨️ Pressing 'C' shortcut 3 times...");
-      for (let i = 0; i < 3; i++) {
-        await this.page.keyboard.press("C");
-        await this.sleep(1000);
-      }
-
-      // 4. Method B: Click the "Captions" icon directly (Bottom right icon)
-      console.log("🖱️ Attempting to click Captions icon...");
+      await this.sleep(3000);
       
-      // Try clicking the CC button selector
-      const captionButtons = [
-        "button[jsname='CQylAd']", // Common CC button
-        "button[aria-label='Turn on captions']",
-        "button[aria-label='Captions']",
-        "button[title='Captions']",
-        "[data-tooltip='Captions (c)']",
-      ];
+      // Turn on captions with 'C' key
+      await this.page.keyboard.press("C");
+      await this.sleep(1000);
+      
+      // Click video to focus
+      await this.page.click("[data-participant-id]").catch(() => {});
+      await this.sleep(1000);
+      
+      // Press 'C' again to ensure they stay on
+      await this.page.keyboard.press("C");
+      await this.sleep(1000);
 
-      for (const selector of captionButtons) {
-        const btn = await this.page.$(selector);
-        if (btn) {
-          console.log("✅ Found Captions button, clicking...");
-          await btn.click();
-          await this.sleep(1000);
-          break;
-        }
-      }
+      console.log("✅ Captions enabled");
 
-      // 5. Method C: If a popup appears saying "Turn on captions", click it
-      console.log("👀 Checking for 'Turn on captions' prompt...");
-      try {
-        const promptBtn = await this.page.waitForSelector("button[jsname='CQylAd'], div[role='dialog'] button", { timeout: 3000 });
-        if (promptBtn) {
-          console.log("✅ Clicking 'Turn on captions' prompt...");
-          await promptBtn.click();
-        }
-      } catch (e) {
-        console.log("ℹ️ No 'Turn on captions' prompt found (that's okay).");
-      }
+      // Keep captions on: watch for them turning off and re-enable
+      await this.page.evaluate(() => {
+        let captionsOn = true;
+        
+        // Watch for caption container appearing/disappearing
+        const observer = new MutationObserver(() => {
+          const captionBox = document.querySelector(".a4cQT, .TBnnec, .CNusmb, .iOzk7, [jsname='tgaKEf'], [data-message-text]");
+          if (!captionBox && captionsOn) {
+            console.log("🔄 Captions turned off, re-enabling...");
+            captionsOn = false;
+            setTimeout(() => {
+              document.dispatchEvent(new KeyboardEvent("keydown", { key: "c" }));
+              captionsOn = true;
+            }, 500);
+          } else if (captionBox) {
+            captionsOn = true;
+          }
+        });
+        
+        observer.observe(document.body, { childList: true, subtree: true });
+        
+        // Periodically ensure captions stay on
+        setInterval(() => {
+          const captionBox = document.querySelector(".a4cQT, .TBnnec, .CNusmb, .iOzk7, [jsname='tgaKEf'], [data-message-text]");
+          if (!captionBox) {
+            document.dispatchEvent(new KeyboardEvent("keydown", { key: "c" }));
+          }
+        }, 10000);
+      });
 
-      console.log("✅ Captions activation sequence complete.");
+      console.log("✅ Caption watcher active");
 
       // Start observing DOM for caption container AND active speaker
       await this.page.evaluate(() => {
