@@ -15,20 +15,53 @@ export default function Login() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    setError(""); setBusy(true);
+    setError("");
+    setBusy(true);
+
     try {
-      mode === "signup" ? await signupEmail(email, pass) : await loginEmail(email, pass);
+      // 🔥 Debug (remove later if you want)
+      console.log("MODE:", mode);
+      console.log("EMAIL:", email);
+      console.log("PASSWORD:", pass);
+
+      // 🔥 Validation
+      if (!email || !pass) {
+        throw new Error("Email and password required");
+      }
+
+      // 🔥 FIXED LOGIC
+      if (mode === "signup") {
+        await signupEmail(email.trim(), pass.trim());
+      } else {
+        await loginEmail(email.trim(), pass.trim());
+      }
+
       go();
     } catch (err) {
-      setError(err.message.replace("Firebase: ", "").replace(/\(auth.*?\)\.?/, "").trim());
-    } finally { setBusy(false); }
+      console.log("FULL ERROR:", err); // 🔥 important
+      setError(
+        err.message
+          .replace("Firebase: ", "")
+          .replace(/\(auth.*?\)\.?/, "")
+          .trim()
+      );
+    } finally {
+      setBusy(false);
+    }
   };
 
   const handleGoogle = async () => {
-    setError(""); setBusy(true);
-    try { await loginGoogle(); go(); }
-    catch (err) { setError(err.message); }
-    finally { setBusy(false); }
+    setError("");
+    setBusy(true);
+    try {
+      await loginGoogle();
+      go();
+    } catch (err) {
+      console.log("GOOGLE ERROR:", err);
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -80,7 +113,13 @@ export default function Login() {
             <div className="login-divider-line" />
           </div>
 
-          <button className="btn-ghost login-google" onClick={handleGoogle} disabled={busy}>
+          {/* 🔥 ONLY CHANGE HERE */}
+          <button
+            type="button"
+            className="btn-ghost login-google"
+            onClick={handleGoogle}
+            disabled={busy}
+          >
             <svg width="16" height="16" viewBox="0 0 24 24">
               <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
               <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
