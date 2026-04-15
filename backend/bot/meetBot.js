@@ -292,47 +292,6 @@ class MeetBot {
     }
   }
 
-    await this.sleep(2000);
-    await this.page.screenshot({ path: "signin-page.png" });
-    console.log("📸 Sign-in page open — please sign in manually");
-
-    const MAX_WAIT = 5 * 60 * 1000;
-    const CHECK_INTERVAL = 2000;
-    let elapsed = 0;
-
-    while (elapsed < MAX_WAIT) {
-      try {
-        const url = this.page.url();
-        if (url.includes("google.com") && !url.includes("accounts.google.com")) {
-          console.log("✅ Sign-in detected!");
-          this.emit("bot-status", { status: "success", message: "Signed in! Going to meeting..." });
-          await this.sleep(2000);
-          return;
-        }
-        if (url.includes("myaccount.google.com")) {
-          console.log("✅ Account page — signed in!");
-          this.emit("bot-status", { status: "success", message: "Signed in! Going to meeting..." });
-          await this.sleep(2000);
-          return;
-        }
-      } catch (_) {}
-
-      await this.sleep(CHECK_INTERVAL);
-      elapsed += CHECK_INTERVAL;
-
-      if (elapsed % 30000 === 0) {
-        console.log(`⏳ Waiting for sign-in... (${Math.floor(elapsed / 1000)}s)`);
-        this.emit("bot-status", {
-          status: "waiting-signin",
-          message: `Waiting for sign-in... (${Math.floor(elapsed / 1000)}s)`,
-        });
-      }
-    }
-
-    console.log("⚠️ Sign-in timeout. Proceeding...");
-    await this.sleep(2000);
-  }
-
   async _joinMeeting() {
     this.emit("bot-status", { status: "joining", message: "Opening Google Meet..." });
 
