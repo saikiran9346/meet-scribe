@@ -32,7 +32,7 @@ const activeBots = new Map();
 // Start bot
 router.post("/bot/start", async (req, res) => {
   const { meetUrl } = req.body;
-  const userId = req.user.uid;
+  const userId = req.user?.uid || "test-user";
 
   if (!meetUrl?.includes("meet.google.com")) {
     return res.status(400).json({ error: "Invalid Google Meet URL" });
@@ -56,7 +56,7 @@ router.post("/bot/start", async (req, res) => {
 // Stop bot + generate summary (BUT DON'T SAVE YET)
 router.post("/bot/stop", async (req, res) => {
   const { sessionId } = req.body;
-  const userId = req.user.uid;
+  const userId = req.user?.uid || "test-user";
   const bot = activeBots.get(sessionId);
 
   if (!bot) return res.status(404).json({ error: "Session not found" });
@@ -118,7 +118,7 @@ router.post("/bot/stop", async (req, res) => {
 // SAVE meeting to dashboard (user explicitly clicks Save)
 router.post("/meetings/:sessionId/save", async (req, res) => {
   const { sessionId } = req.params;
-  const userId = req.user.uid;
+  const userId = req.user?.uid || "test-user";
 
   try {
     // Get from temp storage or already saved
@@ -218,7 +218,7 @@ router.get("/bot/transcript/:sessionId", (req, res) => {
 // List all meetings for user (from local storage — fast, no GCP needed)
 router.get("/meetings", async (req, res) => {
   try {
-    const userId = req.user.uid;
+    const userId = req.user?.uid || "test-user";
     console.log(`📋 GET /meetings - User ID: ${userId}`);
     const meetings = await listMeetings(userId);
     res.json({ meetings });
@@ -244,7 +244,7 @@ router.get("/meetings/:sessionId", async (req, res) => {
     
     // Try saved meetings (requires userId match)
     console.log("Not in temp, trying saved meetings...");
-    const data = await getMeeting(req.user.uid, sessionId);
+    const data = await getMeeting(req.user?.uid || "test-user", sessionId);
     
     if (data) {
       data._saved = true;
@@ -270,7 +270,7 @@ router.get("/meetings/:sessionId", async (req, res) => {
 // Delete meeting
 router.delete("/meetings/:sessionId", async (req, res) => {
   try {
-    await deleteMeeting(req.user.uid, req.params.sessionId);
+    await deleteMeeting(req.user?.uid || "test-user", req.params.sessionId);
     
     // Also delete from Firestore if it exists
     try {
@@ -298,13 +298,13 @@ router.post("/meetings/:sessionId/chat", async (req, res) => {
   try {
     // Load transcript + summary if session not in memory (e.g. after server restart)
     if (!getChatHistory(sessionId).length) {
-      const data = await getMeeting(req.user.uid, sessionId);
+      const data = await getMeeting(req.user?.uid || "test-user", sessionId);
       if (!data) return res.status(404).json({ error: "Meeting not found" });
       initChatSession(sessionId, data.transcript, data.summary);
     }
 
     // Get transcript + summary for context (already in memory after init)
-    const data = await getMeeting(req.user.uid, sessionId);
+    const data = await getMeeting(req.user?.uid || "test-user", sessionId);
     const result = await chatWithMeeting(
       sessionId,
       message,
@@ -329,7 +329,7 @@ router.get("/meetings/:sessionId/chat", (req, res) => {
 // Generate share link
 router.post("/meetings/:sessionId/share", async (req, res) => {
   try {
-    const url = await getShareLink(req.user.uid, req.params.sessionId);
+    const url = await getShareLink(req.user?.uid || "test-user", req.params.sessionId);
     res.json({ url });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -339,7 +339,7 @@ router.post("/meetings/:sessionId/share", async (req, res) => {
 // Get PDF download link
 router.get("/meetings/:sessionId/pdf", async (req, res) => {
   try {
-    const userId = req.user.uid;
+    const userId = req.user?.uid || "test-user";
     const { sessionId } = req.params;
     
     // Check if PDF already exists
@@ -368,7 +368,7 @@ router.get("/meetings/:sessionId/pdf", async (req, res) => {
 // Download PDF file
 router.get("/meetings/:sessionId/pdf/download", async (req, res) => {
   try {
-    const pdfBuffer = await getPdfBuffer(req.user.uid, req.params.sessionId);
+    const pdfBuffer = await getPdfBuffer(req.user?.uid || "test-user", req.params.sessionId);
     if (!pdfBuffer) return res.status(404).json({ error: "PDF not found" });
     
     res.set({
