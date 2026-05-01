@@ -1,0 +1,891 @@
+require("dotenv").config();
+const puppeteer = require("puppeteer");
+const WebSocket = require("ws");
+const { v4: uuidv4 } = require("uuid");
+
+class MeetBot {
+  constructor(sessionId, meetUrl, io) {
+    this.sessionId = sessionId;
+    this.meetUrl = meetUrl;
+    this.io = io;
+    this.browser = null;
+    this.page = null;
+    this.transcript = [];
+    this.isRunning = false;
+    this.recognizeStream = null;
+    this.keepAlive = null;
+    this.audioFunctionRegistered = false;
+    this.audioCaptureStarted = false;
+    this.participantNames = [];
+    this.speakerNameMap = {}; // Maps Deepgram speaker IDs to actual names
+  }
+
+  emit(event, data) {
+    this.io.to(this.sessionId).emit(event, data);
+  }
+
+  sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async launch() {
+    this.isRunning = true;
+    this.emit("bot-status", { status: "launching", message: "Starting browser..." });
+
+    // Launch browser with updated args for Google Meet compatibility
+    this.browser = await puppeteer.launch({
+      headless: false,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-extensions",
+        "--no-first-run",
+        "--disable-infobars",
+        "--lang=en-US",
+        "--start-maximized",
+        // Keep web security enabled to avoid Meet detection issues
+        "--disable-features=WebRtcAllowInputVolumeAdjustment",
+        "--disable-media-session",
+        // Additional flags for Meet compatibility
+        "--disable-webgl",
+        "--disable-component-update",
+        "--disable-background-networking",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-background-timer-throttling",
+        "--disable-ipc-flooding-protection",
+        "--enable-features=WebComponentsV0Enabled",
+      ],
+      defaultViewport: null,
+      ignoreDefaultArgs: ["--enable-automation"],
+    });
+
+    this.page = await this.browser.newPage();
+    await this.page.setViewport({ width: 1440, height: 900 });
+
+    // Anti-detection
+    await this.page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => [
+          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+          { name: 'Native Client', filename: 'internal-nacl-plugin' },
+        ],
+        length: 3,
+      });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+      Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
+      delete window.callPhantom;
+      delete window._phantom;
+      delete window.__phantom;
+      delete window.Buffer;
+      delete window.emit;
+      delete window.spawn;
+      delete window.domAutomation;
+      delete window.domAutomationController;
+      window.chrome = {
+        runtime: { connect: () => {}, onMessage: { addListener: () => {} } },
+        loadTimes: () => ({}),
+        app: {},
+      };
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : originalQuery(parameters);
+    });
+
+    await this.page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    );
+
+    // DENY all permissions - bot should NOT use mic or camera
+    const ctx = this.browser.defaultBrowserContext();
+    await ctx.overridePermissions("https://meet.google.com", []);
+    await ctx.overridePermissions("https://accounts.google.com", []);
+
+    this.page.on("console", (msg) => console.log("Page:", msg.text()));
+    this.page.on("error", (err) => console.error("Page error:", err.message));
+
+    // Step 1: Sign in
+    await this._signInToGoogle();
+
+    // Step 2: Join meeting (waits for admission, then starts transcription)
+    await this._joinMeeting();
+  }
+
+  async _signInToGoogle() {
+    console.log("🔐 Opening Google sign-in page for manual login...");
+    this.emit("bot-status", {
+      status: "waiting-signin",
+      message: "Please sign in to Google in the browser window."
+    });
+
+    await this.page.goto("https://accounts.google.com/ServiceLogin?continue=https://www.google.com", {
+      waitUntil: "networkidle2",
+      timeout: 30000,
+    });
+
+    await this.sleep(2000);
+    await this.page.screenshot({ path: "signin-page.png" });
+
+    console.log("⏳ Waiting for sign-in...");
+
+    const MAX_WAIT = 5 * 60 * 1000; // 5 minutes
+    const CHECK_INTERVAL = 2000;
+    let elapsed = 0;
+
+    while (elapsed < MAX_WAIT) {
+      try {
+        const currentUrl = this.page.url();
+
+        if (currentUrl.includes('google.com') && !currentUrl.includes('accounts.google.com')) {
+          const hasAccountIcon = await this.page.evaluate(() => {
+            return !!document.querySelector('a[aria-label*="Manage your Google Account"], [data-ogpc]');
+          });
+
+          if (hasAccountIcon || currentUrl.includes('www.google.com')) {
+            console.log("✅ Sign-in detected!");
+            this.emit("bot-status", { status: "success", message: "Sign-in detected! Proceeding to meeting..." });
+            await this.sleep(2000);
+            return;
+          }
+        }
+
+        if (currentUrl.includes('myaccount.google.com')) {
+          console.log("✅ Google account page detected!");
+          this.emit("bot-status", { status: "success", message: "Sign-in detected! Proceeding to meeting..." });
+          await this.sleep(2000);
+          return;
+        }
+      } catch (err) {
+        // Continue waiting
+      }
+
+      await this.sleep(CHECK_INTERVAL);
+      elapsed += CHECK_INTERVAL;
+
+      if (elapsed % 30000 === 0) {
+        console.log(`⏳ Still waiting for sign-in... (${Math.floor(elapsed / 1000)}s)`);
+      }
+    }
+
+    console.log("⚠️ Sign-in timeout, proceeding anyway...");
+    await this.sleep(2000);
+  }
+
+  async _joinMeeting() {
+    this.emit("bot-status", { status: "joining", message: "Joining the meeting..." });
+
+    try {
+      console.log("🔗 Navigating to Meet URL:", this.meetUrl);
+
+      await this.page.goto(this.meetUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: 60000,
+      });
+
+      await this.sleep(8000);
+      await this.page.screenshot({ path: "meet-loading.png" });
+
+      // Check for errors
+      const bodyText = await this.page.evaluate(() => document.body.innerText);
+      console.log("📄 Page text:", bodyText.substring(0, 500));
+
+      if (bodyText.includes("You can't join this video call")) {
+        let reason = "Unknown";
+        if (bodyText.includes("organization")) reason = "Organization policy";
+        else if (bodyText.includes("age")) reason = "Age restriction";
+        else if (bodyText.includes("not part of the organization")) reason = "Not in organization";
+
+        this.emit("bot-status", { status: "error", message: `Can't join: ${reason}` });
+        return;
+      }
+
+      if (bodyText.includes("Check your connection") || bodyText.includes("Something went wrong")) {
+        this.emit("bot-status", { status: "error", message: "Network error" });
+        return;
+      }
+
+      // Reload if page is empty
+      if (!bodyText || bodyText.trim().length < 50) {
+        console.log("⚠️ Page empty, reloading...");
+        await this.page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+        await this.sleep(5000);
+      }
+
+      // Type name
+      try {
+        await this.page.waitForSelector('input[placeholder="Your name"]', { timeout: 3000 });
+        await this.page.click('input[placeholder="Your name"]', { clickCount: 3 });
+        await this.page.keyboard.press("Backspace");
+        await this.page.type('input[placeholder="Your name"]', "AI Scribe");
+        await this.sleep(500);
+        console.log("✅ Typed name: AI Scribe");
+      } catch (_) {
+        console.log("⏭️ Name input not found");
+      }
+
+      await this.sleep(2000);
+
+      // Turn off camera
+      try {
+        await this.page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          const btn = buttons.find(b => {
+            const label = b.getAttribute('aria-label') || '';
+            const active = b.getAttribute('data-is-active') === 'true';
+            return label.includes('Turn off camera') || (label.includes('camera') && active);
+          });
+          if (btn && !btn.disabled) btn.click();
+        });
+        await this.sleep(500);
+        console.log("✅ Camera off");
+      } catch (e) {
+        console.log("⚠️ Camera toggle failed:", e.message);
+      }
+
+      // Turn off microphone
+      try {
+        await this.page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          const btn = buttons.find(b => {
+            const label = b.getAttribute('aria-label') || '';
+            const active = b.getAttribute('data-is-active') === 'true';
+            return label.includes('Turn off microphone') || (label.includes('microphone') && active);
+          });
+          if (btn && !btn.disabled) btn.click();
+        });
+        await this.sleep(500);
+        console.log("✅ Microphone off");
+      } catch (e) {
+        console.log("⚠️ Microphone toggle failed:", e.message);
+      }
+
+      await this.page.screenshot({ path: "pre-join-screen.png" });
+      await this.sleep(1500);
+
+      // ═══════════════════════════════════════════════════════
+      // CLICK JOIN - with retries
+      // ═══════════════════════════════════════════════════════
+      let joined = false;
+      let joinAttempts = 0;
+      const MAX_JOIN_ATTEMPTS = 5;
+
+      while (!joined && joinAttempts < MAX_JOIN_ATTEMPTS) {
+        joinAttempts++;
+        console.log(`🔘 Join attempt ${joinAttempts}/${MAX_JOIN_ATTEMPTS}`);
+
+        try {
+          const result = await this.page.evaluate(() => {
+            // Get ALL buttons and their states
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const allButtons = buttons.map(b => ({
+              text: b.innerText?.trim() || '',
+              ariaLabel: b.getAttribute('aria-label') || '',
+              visible: b.getBoundingClientRect().width > 0 && b.getBoundingClientRect().height > 0,
+              disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
+            }));
+
+            // Log all buttons for debugging
+            console.log('ALL BUTTONS:', JSON.stringify(allButtons));
+
+            // Find join button - try exact text first
+            const joinBtn = buttons.find(b => {
+              const text = b.innerText?.trim().toLowerCase() || '';
+              const rect = b.getBoundingClientRect();
+              const visible = rect.width > 0 && rect.height > 0;
+              const notDisabled = !b.disabled && b.getAttribute('aria-disabled') !== 'true';
+              return visible && notDisabled && (text === 'join now' || text === 'ask to join');
+            });
+
+            if (joinBtn) {
+              const text = joinBtn.innerText?.trim() || '';
+              // Dispatch multiple events to ensure click registers
+              joinBtn.focus();
+              const clickEvent = new MouseEvent('click', {
+                bubbles: true,
+                cancelable: true,
+                view: window
+              });
+              joinBtn.dispatchEvent(clickEvent);
+              // Also do a real click
+              joinBtn.click();
+              return text;
+            }
+            return null;
+          });
+
+          if (result) {
+            joined = true;
+            console.log("✅ Clicked join button:", result);
+          } else {
+            console.log("⚠️ No join button found on this attempt");
+          }
+        } catch (e) {
+          console.log("⚠️ Join attempt", joinAttempts, "failed:", e.message);
+        }
+
+        if (!joined) {
+          await this.sleep(3000);
+          // Try to refresh page if first attempt failed
+          if (joinAttempts === 2) {
+            console.log("🔄 Refreshing page and retrying...");
+            try {
+              await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+              await this.sleep(5000);
+              // Try typing name again
+              try {
+                await this.page.type('input[placeholder="Your name"]', "AI Scribe");
+                await this.sleep(1000);
+              } catch (_) {}
+            } catch (e) {
+              console.log("⚠️ Reload failed:", e.message);
+            }
+          }
+        }
+      }
+
+      if (!joined) {
+        this.emit("bot-status", { status: "error", message: "Could not find or click join button after multiple attempts" });
+        return;
+      }
+
+      // ═══════════════════════════════════════════════════════
+      // WAIT FOR PAGE TO TRANSITION AFTER CLICKING JOIN
+      // ═══════════════════════════════════════════════════════
+      console.log("✅ Join clicked - waiting for page to load...");
+      await this.sleep(10000);
+      await this.page.screenshot({ path: "after-join-click.png" });
+
+      // Check what screen we're on after clicking join
+      const afterClickState = await this.page.evaluate(() => {
+        const text = document.body?.innerText || "";
+        return {
+          stillOnPrejoin: text.includes('Ready to join') || text.includes('No one else is here'),
+          stillTrying: text.includes('Still trying to get in'),
+          letsWait: text.includes("Let's wait"),
+          waitingForHost: text.includes('Waiting for the host'),
+          leaveCall: text.includes('Leave call'),
+          meetingDetails: text.includes('Meeting details'),
+          chatEveryone: text.includes('Chat with everyone'),
+          fullText: text,
+        };
+      });
+
+      console.log("📄 After join click state:", JSON.stringify(afterClickState));
+
+      // If still on pre-join screen, click join one more time
+      if (afterClickState.stillOnPrejoin || (!afterClickState.leaveCall && !afterClickState.stillTrying)) {
+        console.log("⚠️ Still on pre-join screen, clicking join again...");
+        try {
+          await this.page.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const joinBtn = buttons.find(b => {
+              const text = b.innerText?.trim().toLowerCase() || '';
+              const rect = b.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0 && !b.disabled &&
+                     (text === 'join now' || text === 'ask to join');
+            });
+            if (joinBtn) {
+              joinBtn.click();
+              return true;
+            }
+            return false;
+          });
+          await this.sleep(8000);
+          await this.page.screenshot({ path: "after-second-join-click.png" });
+        } catch (e) {
+          console.log("⚠️ Second join click failed:", e.message);
+        }
+      }
+
+      await this.sleep(3000);
+
+      // ═══════════════════════════════════════════════════════
+      // WAIT FOR MEETING TO LOAD - SIMPLE & DIRECT
+      // ═══════════════════════════════════════════════════════
+      console.log("⏳ Waiting for meeting to load...");
+      this.emit("bot-status", { status: "joining", message: "Joining the meeting..." });
+
+      let admitted = false;
+      let passes = 0;
+      const REQUIRED = 3;
+      let consecutiveWaitingChecks = 0;
+
+      // Wait up to 120 seconds (60 iterations * 2s) for open meetings
+      // This is PLENTY of time - open meetings join in 5-15 seconds
+      for (let i = 0; i < 60; i++) {
+        await this.sleep(2000);
+
+        try {
+          const state = await this.page.evaluate(() => {
+            const text = document.body?.innerText || "";
+
+            // IN MEETING - this is the ONLY thing that matters
+            const isInMeeting = text.includes('Leave call');
+
+            // ON PRE-JOIN SCREEN - means join didn't work or still loading
+            const isOnPreJoinScreen =
+              text.includes('Ready to join') ||
+              text.includes('Join now') ||
+              text.includes('Ask to join');
+
+            // MEETING LOADING - normal transition, don't worry about this
+            const isLoading =
+              text.includes('Still trying to get in') ||
+              text.includes('Asking to join...') ||
+              text.includes('Let\'s wait') ||
+              text.includes('Waiting') ||
+              text.includes('Loading');
+
+            return {
+              isInMeeting,
+              isOnPreJoinScreen,
+              isLoading,
+              fullText: text.substring(0, 800),
+            };
+          });
+
+          // ═══════════════════════════════════════════════════
+          // SIMPLE LOGIC:
+          // - "Leave call" visible = WE'RE IN THE MEETING ✅
+          // - Everything else = still loading, just wait
+          // ═══════════════════════════════════════════════════
+
+          if (state.isInMeeting) {
+            passes++;
+            console.log(`✓ In meeting confirmed (${passes}/${REQUIRED})`);
+
+            if (passes >= REQUIRED) {
+              admitted = true;
+              console.log("✅✅✅ BOT IS IN THE MEETING!");
+              await this.page.screenshot({ path: "in-meeting.png" });
+              break;
+            }
+          } else {
+            passes = 0; // Reset
+            
+            // Just log status every few seconds
+            if (i % 10 === 0) {
+              console.log(`[Check ${i+1}] inMeeting=${state.isInMeeting} onPrejoin=${state.isOnPreJoinScreen} loading=${state.isLoading}`);
+            }
+          }
+
+          // Check if bot left the meeting
+          if (state.fullText && state.fullText.includes('You left')) {
+            console.log("❌ Bot left the meeting unexpectedly");
+            this.emit("bot-status", { status: "error", message: "Bot left the meeting unexpectedly" });
+            return;
+          }
+
+        } catch (err) {
+          console.log(`⚠️ Check ${i+1} error:`, err.message);
+          if (err.message.includes('detached') || err.message.includes('closed')) {
+            console.log("❌ Page detached - browser may have closed");
+            this.emit("bot-status", { status: "error", message: "Browser page closed" });
+            return;
+          }
+        }
+      }
+
+      // ═══════════════════════════════════════════════════════
+      // START TRANSCRIPTION - ONLY after confirmed admission
+      // ═══════════════════════════════════════════════════════
+      if (admitted) {
+        await this.sleep(3000);
+        console.log("═══════════════════════════════════════════════════════");
+        console.log("✅ STARTING TRANSCRIPTION - Bot is IN THE MEETING");
+        console.log("═══════════════════════════════════════════════════════");
+        this.emit("bot-status", { status: "joined", message: "Bot joined! Listening..." });
+        await this._startTranscription();
+      } else {
+        console.log("❌ Not admitted after timeout");
+        try {
+          await this.page.screenshot({ path: "final-state.png" });
+        } catch (e) {}
+        this.emit("bot-status", {
+          status: "error",
+          message: "Bot not admitted. Host may need to admit manually.",
+        });
+      }
+
+    } catch (err) {
+      console.error("❌ Join error:", err.message);
+      this.emit("bot-status", { status: "error", message: "Failed to join: " + err.message });
+    }
+  }
+
+  async _startTranscription() {
+    console.log("🎤 Starting transcription - connecting to Deepgram...");
+
+    // 1. Connect to Deepgram
+    await this._connectDeepgram();
+
+    // 2. Register sendAudioChunk (only once)
+    if (!this.audioFunctionRegistered) {
+      await this.page.exposeFunction("sendAudioChunk", async (base64Chunk) => {
+        if (this.recognizeStream && this.recognizeStream.readyState === 1) {
+          const buffer = Buffer.from(base64Chunk, "base64");
+          this.recognizeStream.send(buffer);
+          this.chunksSent = (this.chunksSent || 0) + 1;
+          if (this.chunksSent % 50 === 0) {
+            console.log(`📤 Sent ${this.chunksSent} chunks`);
+          }
+        }
+      });
+
+      await this.page.exposeFunction("updateParticipants", (names) => {
+        this.participantNames = names;
+        console.log("👥 Participants:", names.join(", "));
+      }).catch(() => {});
+
+      this.audioFunctionRegistered = true;
+    }
+
+    // 3. Start audio capture - CAPTURE ONLY MEETING AUDIO, NOT SYSTEM MIC
+    if (!this.audioCaptureStarted) {
+      if (this.page.isClosed()) return;
+      await this.page.waitForSelector("body");
+
+      console.log("🎧 Setting up meeting audio capture...");
+
+      await this.page.evaluate(() => {
+        const audioContext = new AudioContext({ sampleRate: 16000 });
+        const connectedElements = new Set();
+        let allMixedStream = null;
+        let mixedSource = null;
+
+        // Get participant names - IMPROVED LOGIC
+        // Google Meet has specific DOM structures for participants
+        function getParticipantNames() {
+          const names = [];
+          const seen = new Set();
+          
+          // Method 1: Look for participant tiles/panels
+          // Google Meet uses data attributes for participant info
+          document.querySelectorAll('[data-participant-name], [data-self-name]').forEach(el => {
+            const name = el.getAttribute('data-participant-name') || el.getAttribute('data-self-name');
+            if (name && isValidName(name) && !seen.has(name)) {
+              seen.add(name);
+              names.push(name);
+            }
+          });
+          
+          // Method 2: Look for people panel entries
+          // When people panel is open, it lists participants
+          document.querySelectorAll('[role="listitem"], [role="option"]').forEach(el => {
+            const ariaLabel = el.getAttribute('aria-label') || '';
+            // Match patterns like "John Doe - muted" or "Jane Smith"
+            const nameMatch = ariaLabel.match(/^([A-Za-z][\w\s]{1,24})\s*(-|–|—|$)/);
+            if (nameMatch) {
+              const name = nameMatch[1].trim();
+              if (isValidName(name) && !seen.has(name)) {
+                seen.add(name);
+                names.push(name);
+              }
+            }
+          });
+          
+          // Method 3: Look for video/audio elements with participant labels
+          // These often have the participant name in aria-label
+          document.querySelectorAll('video, audio').forEach(el => {
+            const parent = el.closest('[aria-label]');
+            if (parent) {
+              const ariaLabel = parent.getAttribute('aria-label') || '';
+              const name = ariaLabel.split(',')[0].trim();
+              if (isValidName(name) && !seen.has(name)) {
+                seen.add(name);
+                names.push(name);
+              }
+            }
+          });
+
+          function isValidName(text) {
+            if (!text) return false;
+            const n = text.trim();
+            if (n.length < 2 || n.length > 25) return false;
+            const words = n.split(/\s+/);
+            if (words.length < 1 || words.length > 3) return false;
+            if (!/^[a-zA-Z]/.test(n)) return false;
+            const lower = n.toLowerCase();
+            const reject = ['mute', 'unmute', 'microphone', 'camera', 'video', 'turn',
+              'leave', 'join', 'call', 'hangup', 'meeting', 'present', 'share', 'screen',
+              'chat', 'caption', 'background', 'effect', 'blur', 'settings', 'options',
+              'more', 'less', 'show', 'hide', 'button', 'icon', 'menu', 'panel', 'tile',
+              'everyone', 'attendee', 'participant', 'host', 'guest', 'waiting', 'trying',
+              'remove', 'side', 'getting', 'items', 'left', 'your', 'you', 'safe', 'invited',
+              'learn', 'press', 'click', 'double', 'close', 'off', 'on', 'raise', 'hand',
+              'react', 'emoji', 'toggle', 'ai scribe', 'meetscribe', 'scribe', 'ready to',
+              'no one', 'anyone'];
+            if (reject.some(w => lower.includes(w))) return false;
+            return true;
+          }
+
+          return names;
+        }
+
+        window._participantNames = [];
+
+        function updateNames() {
+          const names = getParticipantNames();
+          if (names.length > 0) {
+            window._participantNames = names;
+            if (typeof window.updateParticipants === 'function') {
+              window.updateParticipants(names);
+            }
+          }
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // CRITICAL: Capture ONLY meeting audio from <audio> elements
+        // DO NOT use getDisplayMedia or getUserMedia
+        // Those capture system audio / microphone - we don't want that
+        // We ONLY want the audio streams from other meeting participants
+        // ═══════════════════════════════════════════════════════
+
+        function connectMeetingAudio() {
+          const audioElements = document.querySelectorAll('audio');
+          let newAudioFound = false;
+
+          audioElements.forEach((audioEl) => {
+            if (connectedElements.has(audioEl)) return;
+
+            try {
+              // Try to get stream from audio element
+              let stream = null;
+
+              if (audioEl.srcObject) {
+                stream = audioEl.srcObject;
+              } else if (audioEl.captureStream) {
+                stream = audioEl.captureStream();
+              } else if (audioEl.mozCaptureStream) {
+                stream = audioEl.mozCaptureStream();
+              }
+
+              if (stream && stream.getAudioTracks().length > 0) {
+                const source = audioContext.createMediaStreamSource(stream);
+
+                // Mix all participant audio into one stream
+                if (!allMixedStream) {
+                  const dest = audioContext.createMediaStreamDestination();
+                  source.connect(dest);
+                  allMixedStream = dest.stream;
+                  mixedSource = dest;
+                } else {
+                  source.connect(mixedSource);
+                }
+
+                connectedElements.add(audioEl);
+                newAudioFound = true;
+                console.log(`🔗 Connected participant audio:`, stream.getAudioTracks().length, "tracks");
+              }
+            } catch (e) {
+              console.log("⚠️ Audio connect failed:", e.message);
+            }
+          });
+
+          return newAudioFound;
+        }
+
+        // Try initial connection
+        const connected = connectMeetingAudio();
+        updateNames();
+        console.log("🎧 Initial audio setup:", connected ? "Connected" : "No participant audio yet");
+
+        // Watch for new audio elements (late joiners)
+        const observer = new MutationObserver(() => {
+          if (connectMeetingAudio()) {
+            console.log("🔗 New participant audio connected");
+          }
+          updateNames();
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+
+        // Periodic reconnect
+        setInterval(() => {
+          connectMeetingAudio();
+          updateNames();
+        }, 5000);
+
+        // Audio processor - send to Deepgram
+        if (allMixedStream) {
+          const processor = audioContext.createScriptProcessor(4096, 1, 1);
+          const source = audioContext.createMediaStreamSource(allMixedStream);
+          source.connect(processor);
+          processor.connect(audioContext.destination);
+
+          processor.onaudioprocess = (e) => {
+            const inputData = e.inputBuffer.getChannelData(0);
+            const pcm16 = new Int16Array(inputData.length);
+
+            for (let i = 0; i < inputData.length; i++) {
+              const sample = inputData[i] * 32768;
+              pcm16[i] = Math.max(-32768, Math.min(32767, sample));
+            }
+
+            const uint8 = new Uint8Array(pcm16.buffer);
+            let binary = "";
+            for (let j = 0; j < uint8.length; j++) {
+              binary += String.fromCharCode(uint8[j]);
+            }
+
+            if (typeof window.sendAudioChunk === 'function') {
+              window.sendAudioChunk(btoa(binary));
+            }
+          };
+
+          console.log("✅ Audio processor started");
+        } else {
+          console.log("⚠️ No meeting audio available yet - will retry when participants join");
+        }
+
+        updateNames();
+        console.log("✅ Meeting audio capture initialized");
+      });
+
+      this.audioCaptureStarted = true;
+      console.log("✅ Audio capture started - listening to meeting only");
+    }
+  }
+
+  async _connectDeepgram() {
+    if (this.keepAlive) clearInterval(this.keepAlive);
+
+    const url = "wss://api.deepgram.com/v1/listen?model=nova-3&language=en-US&punctuate=true&diarize=true&interim_results=true&encoding=linear16&sample_rate=16000&endpointing=400&smart_format=true&utterances=true";
+
+    const connection = new WebSocket(url, {
+      headers: { Authorization: `Token ${process.env.DEEPGRAM_API_KEY}` },
+    });
+
+    connection.on("open", () => {
+      console.log("✅ Deepgram connected (nova-3)");
+
+      this.keepAlive = setInterval(() => {
+        if (connection.readyState === 1) {
+          const silence = Buffer.alloc(3200, 0);
+          connection.send(silence);
+        }
+      }, 5000);
+    });
+
+    connection.on("message", (message) => {
+      try {
+        const data = JSON.parse(message.toString());
+        const transcript = data.channel?.alternatives?.[0]?.transcript;
+        if (!transcript || !transcript.trim()) return;
+
+        const isFinal = data.is_final;
+        const words = data.channel?.alternatives?.[0]?.words || [];
+
+        if (isFinal && words.length > 0) {
+          const speakerGroups = [];
+          let currentGroup = { speaker: words[0].speaker, words: [] };
+
+          words.forEach((word) => {
+            if (word.speaker === currentGroup.speaker) {
+              currentGroup.words.push(word.word);
+            } else {
+              speakerGroups.push({ ...currentGroup });
+              currentGroup = { speaker: word.speaker, words: [word.word] };
+            }
+          });
+          speakerGroups.push(currentGroup);
+
+          speakerGroups.forEach((group) => {
+            if (!group.words.length) return;
+
+            const speakerIndex = group.speaker ?? 0;
+            let speakerName;
+
+            // Check if we already mapped this speaker ID to a name
+            if (this.speakerNameMap[speakerIndex]) {
+              speakerName = this.speakerNameMap[speakerIndex];
+            } else if (this.participantNames && this.participantNames.length > 0) {
+              // Map speaker ID to participant name (round-robin for unknown speakers)
+              speakerName = this.participantNames[speakerIndex % this.participantNames.length];
+              // Cache this mapping for consistency
+              this.speakerNameMap[speakerIndex] = speakerName;
+            } else {
+              speakerName = `Speaker ${speakerIndex + 1}`;
+            }
+
+            const entry = {
+              id: uuidv4(),
+              text: group.words.join(" ").trim(),
+              timestamp: new Date().toISOString(),
+              speaker: speakerName,
+              speakerIndex: speakerIndex,
+            };
+
+            this.transcript.push(entry);
+            console.log(`📝 [${speakerName}]:`, entry.text);
+            this.emit("transcript-update", { entry, isFinal: true });
+          });
+
+        } else if (!isFinal) {
+          const speakerIndex = data.channel?.alternatives?.[0]?.words?.[0]?.speaker ?? 0;
+          let speakerName;
+          
+          if (this.speakerNameMap[speakerIndex]) {
+            speakerName = this.speakerNameMap[speakerIndex];
+          } else if (this.participantNames && this.participantNames.length > 0 && speakerIndex < this.participantNames.length) {
+            speakerName = this.participantNames[speakerIndex];
+          } else {
+            speakerName = `Speaker ${speakerIndex + 1}`;
+          }
+
+          this.emit("transcript-update", {
+            text: transcript,
+            isFinal: false,
+            speaker: speakerName,
+          });
+        }
+      } catch (e) {
+        console.error("❌ Parse error:", e.message);
+      }
+    });
+
+    connection.on("error", (err) => {
+      console.error("❌ Deepgram error:", err.message);
+    });
+
+    connection.on("close", (code) => {
+      console.log("🔌 Deepgram closed, code:", code);
+      if (this.keepAlive) clearInterval(this.keepAlive);
+      if (this.isRunning) {
+        console.log("🔄 Reconnecting Deepgram...");
+        setTimeout(() => {
+          if (this.isRunning) this._connectDeepgram();
+        }, 1000);
+      }
+    });
+
+    this.recognizeStream = connection;
+  }
+
+  async stop() {
+    this.isRunning = false;
+
+    if (this.keepAlive) clearInterval(this.keepAlive);
+
+    if (this.recognizeStream) {
+      try { this.recognizeStream.close(); } catch (_) {}
+    }
+
+    if (this.browser) await this.browser.close();
+
+    this.emit("bot-status", { status: "stopped", message: "Bot has left the meeting." });
+    return this.transcript;
+  }
+
+  getTranscript() {
+    return this.transcript;
+  }
+}
+
+module.exports = MeetBot;
