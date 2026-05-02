@@ -35,7 +35,10 @@ export default function Session() {
   const cfg    = STATUS_MAP[status] || STATUS_MAP.launching;
 
   useEffect(() => {
-    const socket = io(BASE);
+    const socket = io(BASE, {
+    transports: ["websocket"],   // ✅ FIX
+    withCredentials: false,
+  });
     socketRef.current = socket;
     socket.emit("join-session", sessionId);
 
